@@ -416,6 +416,7 @@ with st.sidebar:
         ("Overview",  "📊"),
         ("Queries",   "💬"),
         ("Products",  "📦"),
+        ("RAG",       "📚"),
         ("Batch",     "📧"),
         ("Guardrail", "🛡️"),
         ("Results",   "📋"),
@@ -864,6 +865,24 @@ def queries_page():
     </style>
     ''', unsafe_allow_html=True)
     
+    # Mode selector before chat
+    mode_col1, mode_col2, mode_col3 = st.columns([1, 2, 1])
+    with mode_col2:
+        use_agentic = st.toggle(
+            "🤖 Enable Agentic Mode (Autonomous AI with Planning & Tool Use)",
+            value=st.session_state.get("agentic_mode", False),
+            key="agentic_mode_toggle",
+            help="When enabled, AI autonomously plans tasks, selects tools, and reasons through multiple steps"
+        )
+        st.session_state["agentic_mode"] = use_agentic
+        
+        if use_agentic:
+            if not hasattr(backend, 'agent_orchestrator') or backend.agent_orchestrator is None:
+                st.warning("⚠️ Agentic framework not available. Falling back to standard mode.")
+                use_agentic = False
+            else:
+                st.info("✨ Agentic mode enabled: AI will autonomously plan and use tools dynamically")
+    
     # Chat messages area
     st.markdown('<div class="chat-container">', unsafe_allow_html=True)
     
@@ -1069,83 +1088,155 @@ def queries_page():
         
         # Show processing indicator
         with st.spinner("🤔 BusinessAI is thinking..."):
-            # Real backend call
+            # Real backend call - use agentic mode if enabled
             t0 = time.time()
-            result = backend.process_customer_query(query_input.strip())
+            use_agentic_mode = st.session_state.get("agentic_mode", False)
+            result = backend.process_customer_query(query_input.strip(), use_agentic=use_agentic_mode)
             duration = round(time.time() - t0, 2)
             
-            raw_type = result["Classification"]
-            display_type = (
-                EmailType.ORDER_REQUEST.value
-                if raw_type == EmailType.ORDER_REQUEST.value
-                else EmailType.PRODUCT_INQUIRY.value
-            )
+            # Check if this is an agentic result
+            is_agentic = "Mode" in result and "Agentic" in result.get("Mode", "")
             
-            response_text = result["Generated Response"]
+            if is_agentic:
+                # Handle agentic mode result
+                response_text = result["Generated Response"]
+                status = result.get("Guardrail Status", "Passed")
+                violations = result.get("Violations", [])
+                
+                # Add AI response to chat with agentic metadata
+                ai_msg = {
+                    "role": "assistant",
+                    "content": response_text,
+                    "timestamp": datetime.now().strftime("%I:%M %p"),
+                    "status": status,
+                    "confidence": 95 if status == "PASSED" else 40,
+                    "duration": duration,
+                    "guardrail_score": 95 if status == "PASSED" else 40,
+                    "type": "agentic_query",
+                    "show_meta": True,
+                    "agentic_data": {
+                        "planning": result.get("Planning", {}),
+                        "execution": result.get("Execution", {}),
+                        "validation": result.get("Validation", {})
+                    }
+                }
+                st.session_state.chat_messages.append(ai_msg)
+                
+                # Save to database (with agentic tag)
+                agents = ["Planner Agent", "Executor Agent", "Validator Agent", "Guardrail Agent"]
+                entry = {
+                    "query": query_input.strip(),
+                    "type": "agentic_query",
+                    "confidence": ai_msg["confidence"],
+                    "status": status,
+                    "timestamp": datetime.now(),
+                    "duration": duration,
+                    "agents": agents,
+                    "response": response_text,
+                    "guardrail_score": ai_msg["guardrail_score"],
+                    "guardrail_checks": {
+                        "agentic_mode": True,
+                        "iterations": result.get("Execution", {}).get("Iterations", 0),
+                        "tools_used": result.get("Execution", {}).get("Tools Used", 0)
+                    },
+                    "order_details": f"Agentic execution with {result.get('Execution', {}).get('Tools Used', 0)} tool calls",
+                    "relevant_products": "N/A",
+                    "violations": violations,
+                }
+                
+                create_query_record(
+                    query=entry["query"],
+                    type=entry["type"],
+                    confidence=entry["confidence"],
+                    status=entry["status"],
+                    timestamp=entry["timestamp"],
+                    duration=entry["duration"],
+                    agents=entry["agents"],
+                    response=entry["response"],
+                    guardrail_score=entry["guardrail_score"],
+                    guardrail_checks=entry["guardrail_checks"],
+                    order_details=entry.get("order_details"),
+                    relevant_products=entry.get("relevant_products"),
+                    violations=entry.get("violations", [])
+                )
+                
+                st.session_state.query_history = get_all_queries()
+                st.session_state.last_query_result = entry
             
-            violations = backend.review_response_for_sensitive_leaks(response_text)
-            guardrail = _build_guardrail_result(violations, response_text)
-            
-            confidence = 96 if guardrail["passed"] else 42
-            status = "Passed" if guardrail["passed"] else "Blocked"
-            
-            agents = ["Query Classifier"]
-            if display_type == EmailType.ORDER_REQUEST.value:
-                agents.append("Order Agent")
             else:
-                agents.append("Product Agent")
-                agents.append("Analysis Agent")
-            agents.append("Guardrail Agent")
-            
-            # Add AI response to chat
-            ai_msg = {
-                "role": "assistant",
-                "content": response_text,
-                "timestamp": datetime.now().strftime("%I:%M %p"),
-                "status": status,
-                "confidence": confidence,
-                "duration": duration,
-                "guardrail_score": guardrail["score"],
-                "type": display_type,
-                "show_meta": True
-            }
-            st.session_state.chat_messages.append(ai_msg)
-            
-            # Save to database
-            entry = {
-                "query": query_input.strip(),
-                "type": display_type,
-                "confidence": confidence,
-                "status": status,
-                "timestamp": datetime.now(),
-                "duration": duration,
-                "agents": agents,
-                "response": response_text,
-                "guardrail_score": guardrail["score"],
-                "guardrail_checks": guardrail["checks"],
-                "order_details": result.get("Order Details (if applicable)", "N/A"),
-                "relevant_products": result.get("Relevant Products (if applicable)", "N/A"),
-                "violations": violations,
-            }
-            
-            create_query_record(
-                query=entry["query"],
-                type=entry["type"],
-                confidence=entry["confidence"],
-                status=entry["status"],
-                timestamp=entry["timestamp"],
-                duration=entry["duration"],
-                agents=entry["agents"],
-                response=entry["response"],
-                guardrail_score=entry["guardrail_score"],
-                guardrail_checks=entry["guardrail_checks"],
-                order_details=entry.get("order_details"),
-                relevant_products=entry.get("relevant_products"),
-                violations=entry.get("violations", [])
-            )
-            
-            st.session_state.query_history = get_all_queries()
-            st.session_state.last_query_result = entry
+                # Standard mode result (existing code)
+                raw_type = result["Classification"]
+                display_type = (
+                    EmailType.ORDER_REQUEST.value
+                    if raw_type == EmailType.ORDER_REQUEST.value
+                    else EmailType.PRODUCT_INQUIRY.value
+                )
+                
+                response_text = result["Generated Response"]
+                
+                violations = backend.review_response_for_sensitive_leaks(response_text)
+                guardrail = _build_guardrail_result(violations, response_text)
+                
+                confidence = 96 if guardrail["passed"] else 42
+                status = "Passed" if guardrail["passed"] else "Blocked"
+                
+                agents = ["Query Classifier"]
+                if display_type == EmailType.ORDER_REQUEST.value:
+                    agents.append("Order Agent")
+                else:
+                    agents.append("Product Agent")
+                    agents.append("Analysis Agent")
+                agents.append("Guardrail Agent")
+                
+                # Add AI response to chat
+                ai_msg = {
+                    "role": "assistant",
+                    "content": response_text,
+                    "timestamp": datetime.now().strftime("%I:%M %p"),
+                    "status": status,
+                    "confidence": confidence,
+                    "duration": duration,
+                    "guardrail_score": guardrail["score"],
+                    "type": display_type,
+                    "show_meta": True
+                }
+                st.session_state.chat_messages.append(ai_msg)
+                
+                # Save to database
+                entry = {
+                    "query": query_input.strip(),
+                    "type": display_type,
+                    "confidence": confidence,
+                    "status": status,
+                    "timestamp": datetime.now(),
+                    "duration": duration,
+                    "agents": agents,
+                    "response": response_text,
+                    "guardrail_score": guardrail["score"],
+                    "guardrail_checks": guardrail["checks"],
+                    "order_details": result.get("Order Details (if applicable)", "N/A"),
+                    "relevant_products": result.get("Relevant Products (if applicable)", "N/A"),
+                    "violations": violations,
+                }
+                
+                create_query_record(
+                    query=entry["query"],
+                    type=entry["type"],
+                    confidence=entry["confidence"],
+                    status=entry["status"],
+                    timestamp=entry["timestamp"],
+                    duration=entry["duration"],
+                    agents=entry["agents"],
+                    response=entry["response"],
+                    guardrail_score=entry["guardrail_score"],
+                    guardrail_checks=entry["guardrail_checks"],
+                    order_details=entry.get("order_details"),
+                    relevant_products=entry.get("relevant_products"),
+                    violations=entry.get("violations", [])
+                )
+                
+                st.session_state.query_history = get_all_queries()
+                st.session_state.last_query_result = entry
         
         # Clear input and rerun
         st.session_state.prefill_query = ""
@@ -1487,6 +1578,289 @@ def results_page():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ── PAGE: RAG Knowledge Base ──────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+
+def rag_page():
+    """RAG Knowledge Base Management Interface"""
+    
+    st.markdown('<div class="section-title">RAG Knowledge Base</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-subtitle">Upload and manage documents for context-aware AI responses</div>', unsafe_allow_html=True)
+    
+    # Check if RAG is available
+    if not hasattr(backend, 'rag_pipeline') or backend.rag_pipeline is None:
+        st.warning("⚠️ RAG pipeline is not initialized. Please check your installation.")
+        st.info("Install RAG dependencies: `pip install chromadb sentence-transformers pypdf python-docx`")
+        return
+    
+    rag = backend.rag_pipeline
+    
+    # Get RAG stats
+    stats = rag.get_stats()
+    
+    # ── Stats Overview ───────────────────────────────────────────────────────
+    st.markdown("<div style='height:20px;'></div>", unsafe_allow_html=True)
+    
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.markdown(
+            f'<div class="metric-card" style="--metric-accent:var(--teal);">'
+            f'<div class="metric-value">{stats["total_chunks"]}</div>'
+            f'<div class="metric-label">Document Chunks</div>'
+            f'</div>',
+            unsafe_allow_html=True
+        )
+    
+    with col2:
+        st.markdown(
+            f'<div class="metric-card" style="--metric-accent:var(--slate);">'
+            f'<div class="metric-value">{stats["unique_sources"]}</div>'
+            f'<div class="metric-label">Unique Documents</div>'
+            f'</div>',
+            unsafe_allow_html=True
+        )
+    
+    with col3:
+        st.markdown(
+            f'<div class="metric-card" style="--metric-accent:var(--amber);">'
+            f'<div class="metric-value">{stats.get("embedding_model", "N/A").split("-")[-1]}</div>'
+            f'<div class="metric-label">Embedding Model</div>'
+            f'</div>',
+            unsafe_allow_html=True
+        )
+    
+    with col4:
+        st.markdown(
+            f'<div class="metric-card" style="--metric-accent:var(--rust);">'
+            f'<div class="metric-value">{"Active" if stats["total_chunks"] > 0 else "Empty"}</div>'
+            f'<div class="metric-label">RAG Status</div>'
+            f'</div>',
+            unsafe_allow_html=True
+        )
+    
+    st.markdown("<div style='height:30px;'></div>", unsafe_allow_html=True)
+    
+    # ── Two Column Layout ────────────────────────────────────────────────────
+    left_col, right_col = st.columns([1, 1])
+    
+    # ── LEFT: Document Upload ────────────────────────────────────────────────
+    with left_col:
+        st.markdown('<div class="card"><div class="card-header">📤 Upload Documents</div>', unsafe_allow_html=True)
+        
+        st.markdown(
+            '<p style="font-size:13px;color:var(--ink-soft);margin-bottom:16px;">'
+            'Supported formats: PDF, DOCX, TXT, CSV'
+            '</p>',
+            unsafe_allow_html=True
+        )
+        
+        uploaded_files = st.file_uploader(
+            "Choose files",
+            type=['pdf', 'docx', 'txt', 'csv'],
+            accept_multiple_files=True,
+            key="rag_uploader",
+            label_visibility="collapsed"
+        )
+        
+        if uploaded_files:
+            st.markdown(f"<p style='font-size:13px;color:var(--ink-soft);'>📎 {len(uploaded_files)} file(s) selected</p>", unsafe_allow_html=True)
+            
+            if st.button("🚀 Ingest Documents", type="primary", use_container_width=True):
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                results = []
+                for i, uploaded_file in enumerate(uploaded_files):
+                    status_text.text(f"Processing {uploaded_file.name}...")
+                    
+                    # Save temporarily
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=Path(uploaded_file.name).suffix) as tmp_file:
+                        tmp_file.write(uploaded_file.read())
+                        tmp_path = tmp_file.name
+                    
+                    # Ingest
+                    result = rag.ingest_document(
+                        tmp_path,
+                        metadata={"uploaded_at": str(datetime.now())}
+                    )
+                    results.append((uploaded_file.name, result))
+                    
+                    # Cleanup
+                    os.unlink(tmp_path)
+                    
+                    progress_bar.progress((i + 1) / len(uploaded_files))
+                
+                status_text.empty()
+                progress_bar.empty()
+                
+                # Show results
+                for filename, result in results:
+                    if result['success']:
+                        st.success(f"✅ {filename}: {result['chunks_added']} chunks added")
+                    else:
+                        st.error(f"❌ {filename}: {result.get('error', 'Unknown error')}")
+                
+                st.rerun()
+        
+        st.markdown('</div>', unsafe_allow_html=True)
+        
+        # ── Direct Text Input ────────────────────────────────────────────────
+        st.markdown("<div style='height:20px;'></div>", unsafe_allow_html=True)
+        st.markdown('<div class="card"><div class="card-header">✍️ Add Text Directly</div>', unsafe_allow_html=True)
+        
+        direct_text = st.text_area(
+            "Paste text content",
+            height=150,
+            placeholder="Paste policy documents, product guides, or any reference material...",
+            label_visibility="collapsed"
+        )
+        
+        text_source_name = st.text_input(
+            "Source name",
+            placeholder="e.g., 'Warranty Policy', 'Product Manual'",
+            label_visibility="collapsed"
+        )
+        
+        if st.button("➕ Add Text to Knowledge Base", use_container_width=True):
+            if direct_text and text_source_name:
+                with st.spinner("Adding text..."):
+                    result = rag.ingest_text(
+                        direct_text,
+                        source_name=text_source_name,
+                        metadata={"added_at": str(datetime.now())}
+                    )
+                
+                if result['success']:
+                    st.success(f"✅ Added {result['chunks_added']} chunks from '{text_source_name}'")
+                    st.rerun()
+                else:
+                    st.error(f"❌ Error: {result.get('error', 'Unknown error')}")
+            else:
+                st.warning("Please provide both text and source name")
+        
+        st.markdown('</div>', unsafe_allow_html=True)
+    
+    # ── RIGHT: Search & Management ───────────────────────────────────────────
+    with right_col:
+        st.markdown('<div class="card"><div class="card-header">🔍 Test RAG Search</div>', unsafe_allow_html=True)
+        
+        search_query = st.text_input(
+            "Search query",
+            placeholder="Enter a query to test semantic search...",
+            label_visibility="collapsed"
+        )
+        
+        n_results = st.slider("Number of results", 1, 10, 3, key="rag_search_slider")
+        
+        if st.button("🔎 Search", use_container_width=True):
+            if search_query:
+                with st.spinner("Searching..."):
+                    results = rag.search(search_query, n_results=n_results)
+                
+                if results:
+                    st.markdown(f"<p style='font-size:13px;color:var(--teal);font-weight:600;margin-top:16px;'>Found {len(results)} relevant chunks:</p>", unsafe_allow_html=True)
+                    
+                    for i, result in enumerate(results, 1):
+                        similarity_pct = int(result['similarity'] * 100)
+                        st.markdown(
+                            f'<div style="background:var(--panel-sunk);border-radius:8px;padding:14px;margin-bottom:12px;border-left:3px solid var(--teal);">'
+                            f'<div style="display:flex;justify-content:space-between;margin-bottom:8px;">'
+                            f'<span style="font-size:12px;font-weight:600;color:var(--ink);">Result {i}</span>'
+                            f'<span style="font-size:11px;color:var(--teal);font-family:monospace;">{similarity_pct}% match</span>'
+                            f'</div>'
+                            f'<p style="font-size:13px;color:var(--ink-soft);margin:0;line-height:1.6;">{result["text"][:300]}...</p>'
+                            f'<p style="font-size:11px;color:var(--ink-faint);margin-top:8px;margin-bottom:0;">Source: {result["metadata"].get("source", "Unknown")}</p>'
+                            f'</div>',
+                            unsafe_allow_html=True
+                        )
+                else:
+                    st.info("No results found. Try a different query.")
+            else:
+                st.warning("Please enter a search query")
+        
+        st.markdown('</div>', unsafe_allow_html=True)
+        
+        # ── Document Management ──────────────────────────────────────────────
+        st.markdown("<div style='height:20px;'></div>", unsafe_allow_html=True)
+        st.markdown('<div class="card"><div class="card-header">🗂️ Manage Documents</div>', unsafe_allow_html=True)
+        
+        if stats['sources']:
+            st.markdown(
+                f'<p style="font-size:13px;color:var(--ink-soft);margin-bottom:16px;">'
+                f'Currently tracking {len(stats["sources"])} document(s)'
+                f'</p>',
+                unsafe_allow_html=True
+            )
+            
+            # List sources
+            for source in stats['sources']:
+                col_a, col_b = st.columns([3, 1])
+                with col_a:
+                    st.markdown(
+                        f'<p style="font-size:13px;color:var(--ink);margin:8px 0;">📄 {source}</p>',
+                        unsafe_allow_html=True
+                    )
+                with col_b:
+                    if st.button("🗑️", key=f"delete_{source}", help=f"Delete {source}"):
+                        with st.spinner(f"Deleting {source}..."):
+                            rag.delete_by_source(source)
+                        st.success(f"Deleted {source}")
+                        st.rerun()
+        else:
+            st.info("No documents in knowledge base yet. Upload some documents to get started!")
+        
+        st.markdown("<div style='height:16px;'></div>", unsafe_allow_html=True)
+        
+        # Clear all button
+        if stats['total_chunks'] > 0:
+            if st.button("🗑️ Clear All Documents", type="secondary", use_container_width=True):
+                if st.session_state.get('confirm_clear_rag'):
+                    with st.spinner("Clearing knowledge base..."):
+                        rag.clear_collection()
+                    st.success("Knowledge base cleared")
+                    st.session_state['confirm_clear_rag'] = False
+                    st.rerun()
+                else:
+                    st.session_state['confirm_clear_rag'] = True
+                    st.warning("⚠️ Click again to confirm deletion of all documents")
+        
+        st.markdown('</div>', unsafe_allow_html=True)
+    
+    # ── How RAG Works ────────────────────────────────────────────────────────
+    st.markdown("<div style='height:30px;'></div>", unsafe_allow_html=True)
+    
+    with st.expander("ℹ️ How RAG Works in Your System"):
+        st.markdown("""
+        ### Retrieval-Augmented Generation (RAG)
+        
+        RAG enhances AI responses by providing relevant context from your documents:
+        
+        **1. Document Processing**
+        - Documents are split into semantic chunks (500 characters with overlap)
+        - Each chunk is converted into a vector embedding using sentence-transformers
+        - Embeddings are stored in ChromaDB for fast retrieval
+        
+        **2. Query Processing**
+        - When a user asks a question, it's converted to a vector embedding
+        - The system searches for the most similar document chunks
+        - Top matches are retrieved based on semantic similarity
+        
+        **3. Response Generation**
+        - Retrieved document context is added to the LLM prompt
+        - The AI generates responses using both product data AND document knowledge
+        - Guardrails still apply to prevent sensitive data leaks
+        
+        **Benefits:**
+        - Answer questions about policies, warranties, and procedures
+        - Provide detailed product information from manuals
+        - Reference company guidelines and standards
+        - Maintain consistency across responses
+        """)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # ── PAGE: Export ──────────────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1574,6 +1948,7 @@ page = st.session_state.current_page
 if   page == "Overview":  overview_page()
 elif page == "Queries":   queries_page()
 elif page == "Products":  products_page()
+elif page == "RAG":       rag_page()
 elif page == "Batch":     batch_page()
 elif page == "Guardrail": guardrail_page()
 elif page == "Results":   results_page()

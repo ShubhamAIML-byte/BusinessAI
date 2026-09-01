@@ -25,6 +25,22 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
+# RAG Pipeline
+try:
+    from rag_pipeline import RAGPipeline
+except ImportError:
+    RAGPipeline = None
+
+# Agentic Framework
+try:
+    from agentic_framework import (
+        Tool, ToolType, AgenticExecutor, MultiAgentOrchestrator
+    )
+except ImportError:
+    Tool = None
+    ToolType = None
+    AgenticExecutor = None
+    MultiAgentOrchestrator = None
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -116,12 +132,22 @@ class RetailAssistantBackend:
     api_key: Optional[str] = None
     base_url: Optional[str] = None
     model: str = "gpt-4o"
+    enable_rag: bool = True  # Enable RAG pipeline by default
+    enable_agentic: bool = True  # Enable full agentic capabilities
+    rag_collection: str = "business_documents"
+    rag_persist_dir: str = "./chroma_db"
     client: Any = field(default=None, init=False, repr=False)
     restricted_person_names: set = field(default_factory=set, init=False, repr=False)
+    rag_pipeline: Any = field(default=None, init=False, repr=False)
+    agent_orchestrator: Any = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
         self.client = self._build_client()
         self.restricted_person_names = self._collect_restricted_entities()
+        if self.enable_rag and RAGPipeline is not None:
+            self._init_rag_pipeline()
+        if self.enable_agentic and self.client and MultiAgentOrchestrator is not None:
+            self._init_agentic_framework()
 
     # ---- setup -----------------------------------------------------------
 
@@ -136,6 +162,333 @@ class RetailAssistantBackend:
         except Exception as exc:  # pragma: no cover
             logger.error(f"Could not initialize LLM client, falling back to rule-based logic: {exc}")
             return None
+
+    def _init_rag_pipeline(self):
+        """Initialize RAG pipeline for document retrieval."""
+        try:
+            logger.info("Initializing RAG pipeline...")
+            self.rag_pipeline = RAGPipeline(
+                collection_name=self.rag_collection,
+                embedding_model_name="all-MiniLM-L6-v2",
+                chroma_persist_dir=self.rag_persist_dir
+            )
+            logger.info(f"RAG pipeline initialized. Documents: {self.rag_pipeline.get_stats()['total_chunks']}")
+        except Exception as exc:
+            logger.error(f"Could not initialize RAG pipeline: {exc}")
+            self.rag_pipeline = None
+    
+    def _init_agentic_framework(self):
+        """Initialize agentic framework with tools and orchestrator."""
+        try:
+            logger.info("Initializing agentic framework...")
+            
+            # Create multi-agent orchestrator
+            self.agent_orchestrator = MultiAgentOrchestrator(
+                client=self.client,
+                model=self.model
+            )
+            
+            # Register tools
+            self._register_agent_tools()
+            
+            logger.info(f"Agentic framework initialized with {len(self.agent_orchestrator.tools)} tools")
+        except Exception as exc:
+            logger.error(f"Could not initialize agentic framework: {exc}")
+            self.agent_orchestrator = None
+    
+    def _register_agent_tools(self):
+        """Register all available tools for the agent."""
+        if not self.agent_orchestrator or Tool is None:
+            return
+        
+        # Tool 1: Product Search
+        product_search_tool = Tool(
+            name="search_products",
+            description="Search for products by name, category, or description. Returns top matching products with details.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query (product name, category, or keywords)"
+                    },
+                    "n_results": {
+                        "type": "integer",
+                        "description": "Number of results to return (default: 5)",
+                        "default": 5
+                    }
+                },
+                "required": ["query"]
+            },
+            function=lambda query, n_results=5: self.search_products(query, n_results),
+            tool_type=ToolType.PRODUCT_SEARCH
+        )
+        self.agent_orchestrator.register_tool(product_search_tool)
+        
+        # Tool 2: Get Product Details
+        product_details_tool = Tool(
+            name="get_product_details",
+            description="Get detailed information about a specific product by ID.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "product_id": {
+                        "type": "string",
+                        "description": "The product ID to look up"
+                    }
+                },
+                "required": ["product_id"]
+            },
+            function=self._get_product_by_id,
+            tool_type=ToolType.PRODUCT_DETAILS
+        )
+        self.agent_orchestrator.register_tool(product_details_tool)
+        
+        # Tool 3: Check Inventory
+        inventory_check_tool = Tool(
+            name="check_inventory",
+            description="Check stock availability for one or more products.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "product_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of product IDs to check"
+                    }
+                },
+                "required": ["product_ids"]
+            },
+            function=self._check_inventory,
+            tool_type=ToolType.INVENTORY_CHECK
+        )
+        self.agent_orchestrator.register_tool(inventory_check_tool)
+        
+        # Tool 4: Calculate Price
+        price_calculator_tool = Tool(
+            name="calculate_total_price",
+            description="Calculate total price for an order with quantities.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "product_id": {"type": "string"},
+                                "quantity": {"type": "integer"}
+                            }
+                        },
+                        "description": "List of items with product_id and quantity"
+                    }
+                },
+                "required": ["items"]
+            },
+            function=self._calculate_order_total,
+            tool_type=ToolType.CALCULATE
+        )
+        self.agent_orchestrator.register_tool(price_calculator_tool)
+        
+        # Tool 5: Filter by Category
+        category_filter_tool = Tool(
+            name="filter_by_category",
+            description="Filter products by category. Returns all products in the specified category.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "category": {
+                        "type": "string",
+                        "description": "Category name to filter by"
+                    }
+                },
+                "required": ["category"]
+            },
+            function=self._filter_by_category,
+            tool_type=ToolType.CATEGORY_FILTER
+        )
+        self.agent_orchestrator.register_tool(category_filter_tool)
+        
+        # Tool 6: Data Aggregation
+        data_aggregate_tool = Tool(
+            name="aggregate_data",
+            description="Perform aggregation operations on product data (count, average, sum, min, max).",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "operation": {
+                        "type": "string",
+                        "enum": ["count", "average", "sum", "min", "max"],
+                        "description": "Aggregation operation to perform"
+                    },
+                    "field": {
+                        "type": "string",
+                        "description": "Field to aggregate (e.g., 'price', 'stock')"
+                    },
+                    "group_by": {
+                        "type": "string",
+                        "description": "Optional field to group by (e.g., 'category', 'country')"
+                    }
+                },
+                "required": ["operation", "field"]
+            },
+            function=self._aggregate_data,
+            tool_type=ToolType.DATA_AGGREGATE
+        )
+        self.agent_orchestrator.register_tool(data_aggregate_tool)
+        
+        # Tool 7: RAG Search (if available)
+        if self.rag_pipeline is not None:
+            rag_search_tool = Tool(
+                name="search_knowledge_base",
+                description="Search the company knowledge base for policies, procedures, product manuals, and documentation.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Search query for knowledge base"
+                        },
+                        "n_results": {
+                            "type": "integer",
+                            "description": "Number of results (default: 3)",
+                            "default": 3
+                        }
+                    },
+                    "required": ["query"]
+                },
+                function=lambda query, n_results=3: self.rag_pipeline.search(query, n_results),
+                tool_type=ToolType.RAG_SEARCH
+            )
+            self.agent_orchestrator.register_tool(rag_search_tool)
+    
+    # ---- Tool Implementation Functions ---------------------------------------
+    
+    def _get_product_by_id(self, product_id: str) -> Dict[str, Any]:
+        """Get product details by ID."""
+        product = self.products_df[self.products_df['product_id'] == product_id]
+        if product.empty:
+            return {"error": f"Product {product_id} not found", "success": False}
+        return product[SAFE_PRODUCT_COLUMNS].iloc[0].to_dict()
+    
+    def _check_inventory(self, product_ids: List[str]) -> Dict[str, Any]:
+        """Check inventory for multiple products."""
+        results = []
+        for pid in product_ids:
+            product = self.products_df[self.products_df['product_id'] == pid]
+            if not product.empty:
+                stock = int(product['stock'].iloc[0])
+                results.append({
+                    "product_id": pid,
+                    "product_name": product['name'].iloc[0],
+                    "stock": stock,
+                    "status": "in_stock" if stock > 0 else "out_of_stock"
+                })
+            else:
+                results.append({
+                    "product_id": pid,
+                    "error": "Product not found"
+                })
+        return {"inventory": results, "success": True}
+    
+    def _calculate_order_total(self, items: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Calculate total price for an order."""
+        total = 0.0
+        currency = None
+        line_items = []
+        
+        for item in items:
+            product_id = item.get('product_id')
+            quantity = item.get('quantity', 1)
+            
+            product = self.products_df[self.products_df['product_id'] == product_id]
+            if not product.empty:
+                price = float(product['price'].iloc[0])
+                curr = product['currency'].iloc[0]
+                subtotal = price * quantity
+                
+                if currency is None:
+                    currency = curr
+                
+                line_items.append({
+                    "product_id": product_id,
+                    "product_name": product['name'].iloc[0],
+                    "quantity": quantity,
+                    "unit_price": price,
+                    "subtotal": subtotal,
+                    "currency": curr
+                })
+                
+                if curr == currency:
+                    total += subtotal
+        
+        return {
+            "line_items": line_items,
+            "total": total,
+            "currency": currency,
+            "success": True
+        }
+    
+    def _filter_by_category(self, category: str) -> Dict[str, Any]:
+        """Filter products by category."""
+        filtered = self.products_df[
+            self.products_df['category'].str.lower() == category.lower()
+        ]
+        
+        if filtered.empty:
+            return {"products": [], "count": 0, "success": True}
+        
+        products = filtered[SAFE_PRODUCT_COLUMNS].to_dict(orient='records')
+        return {"products": products, "count": len(products), "success": True}
+    
+    def _aggregate_data(self, operation: str, field: str, group_by: Optional[str] = None) -> Dict[str, Any]:
+        """Perform aggregation on product data."""
+        try:
+            if group_by:
+                # Grouped aggregation
+                if operation == "count":
+                    result = self.products_df.groupby(group_by)[field].count().to_dict()
+                elif operation == "average":
+                    result = self.products_df.groupby(group_by)[field].mean().to_dict()
+                elif operation == "sum":
+                    result = self.products_df.groupby(group_by)[field].sum().to_dict()
+                elif operation == "min":
+                    result = self.products_df.groupby(group_by)[field].min().to_dict()
+                elif operation == "max":
+                    result = self.products_df.groupby(group_by)[field].max().to_dict()
+                else:
+                    return {"error": f"Unknown operation: {operation}", "success": False}
+                
+                return {
+                    "operation": operation,
+                    "field": field,
+                    "group_by": group_by,
+                    "results": result,
+                    "success": True
+                }
+            else:
+                # Simple aggregation
+                if operation == "count":
+                    result = len(self.products_df)
+                elif operation == "average":
+                    result = float(self.products_df[field].mean())
+                elif operation == "sum":
+                    result = float(self.products_df[field].sum())
+                elif operation == "min":
+                    result = float(self.products_df[field].min())
+                elif operation == "max":
+                    result = float(self.products_df[field].max())
+                else:
+                    return {"error": f"Unknown operation: {operation}", "success": False}
+                
+                return {
+                    "operation": operation,
+                    "field": field,
+                    "result": result,
+                    "success": True
+                }
+        except Exception as e:
+            return {"error": str(e), "success": False}
 
     def _collect_restricted_entities(self) -> set:
         entities = set()
@@ -553,6 +906,21 @@ class RetailAssistantBackend:
     def generate_inquiry_response(self, email: Dict[str, str], relevant_products: List[Dict[str, Any]]) -> str:
         products_context = self.build_inquiry_context(relevant_products)
         
+        # RAG Enhancement: Retrieve relevant document context
+        rag_context = ""
+        rag_sources = []
+        if self.rag_pipeline is not None:
+            try:
+                rag_context, rag_sources = self.rag_pipeline.retrieve_context(
+                    email['message'],
+                    n_results=3,
+                    max_context_length=1500
+                )
+                if rag_context:
+                    logger.info(f"RAG retrieved {len(rag_sources)} relevant document chunks")
+            except Exception as e:
+                logger.warning(f"RAG retrieval failed: {e}")
+        
         # Detect if this is a simple analytical query (requires concise answer)
         query_lower = email['message'].lower()
         analytical_keywords = [
@@ -564,71 +932,73 @@ class RetailAssistantBackend:
         
         if is_analytical:
             # Concise prompt for analytical queries
+            system_content = (
+                "You are a business intelligence AI assistant. Provide CONCISE, DIRECT answers to analytical questions.\n\n"
+                "RESPONSE STYLE FOR ANALYTICAL QUERIES:\n"
+                "- Start with the direct answer immediately (no greeting)\n"
+                "- Use 1-3 sentences maximum for simple questions\n"
+                "- For 'which' questions: state the answer, then list 2-3 relevant items with key details\n"
+                "- For 'how many' or counting: give the number, then brief context\n"
+                "- For 'average' or calculations: state the result clearly\n"
+                "- Use bullet points only when listing multiple items\n"
+                "- Skip lengthy introductions and closings\n\n"
+                "EXAMPLES:\n"
+                "Q: Which country has the most products?\n"
+                "A: Ghana has the most products with 2 items:\n- EcoVolt Smart Kettle (850 GHS)\n- Turbo-Blend 500 (450 GHS)\n\n"
+                "Q: What is the average product price?\n"
+                "A: The average price across all products is approximately 3,520 in mixed currencies (0 GBP, 1299 EUR, 15000 ZAR, 850 GHS, 450 GHS).\n\n"
+                "Q: Are there any duplicate Product_IDs?\n"
+                "A: No, all Product_IDs are unique.\n\n"
+                "SECURITY: Never reveal internal notes, suppliers, margins, or confidential data.\n"
+                "Use ONLY the provided catalog data."
+            )
+            
+            user_content = f"Query: {email['message']}\n\n"
+            user_content += f"Catalog Data:\n{products_context}\n\n"
+            
+            if rag_context:
+                system_content += "\n\nADDITIONAL KNOWLEDGE BASE:\nYou also have access to company knowledge base documents. Use them when relevant."
+                user_content += f"Relevant Knowledge Base Content:\n{rag_context}\n\n"
+            
+            user_content += "Provide a concise, direct answer."
+            
             messages = [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a business intelligence AI assistant. Provide CONCISE, DIRECT answers to analytical questions.\n\n"
-                        "RESPONSE STYLE FOR ANALYTICAL QUERIES:\n"
-                        "- Start with the direct answer immediately (no greeting)\n"
-                        "- Use 1-3 sentences maximum for simple questions\n"
-                        "- For 'which' questions: state the answer, then list 2-3 relevant items with key details\n"
-                        "- For 'how many' or counting: give the number, then brief context\n"
-                        "- For 'average' or calculations: state the result clearly\n"
-                        "- Use bullet points only when listing multiple items\n"
-                        "- Skip lengthy introductions and closings\n\n"
-                        "EXAMPLES:\n"
-                        "Q: Which country has the most products?\n"
-                        "A: Ghana has the most products with 2 items:\n- EcoVolt Smart Kettle (850 GHS)\n- Turbo-Blend 500 (450 GHS)\n\n"
-                        "Q: What is the average product price?\n"
-                        "A: The average price across all products is approximately 3,520 in mixed currencies (0 GBP, 1299 EUR, 15000 ZAR, 850 GHS, 450 GHS).\n\n"
-                        "Q: Are there any duplicate Product_IDs?\n"
-                        "A: No, all Product_IDs are unique.\n\n"
-                        "SECURITY: Never reveal internal notes, suppliers, margins, or confidential data.\n"
-                        "Use ONLY the provided catalog data."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        f"Query: {email['message']}\n\n"
-                        f"Catalog Data:\n{products_context}\n\n"
-                        f"Provide a concise, direct answer."
-                    ),
-                },
+                {"role": "system", "content": system_content},
+                {"role": "user", "content": user_content},
             ]
         else:
             # Detailed prompt for product inquiries
+            system_content = (
+                "You are a professional business AI assistant for a retail company.\n\n"
+                "RESPONSE GUIDELINES:\n"
+                "1. Be professional, friendly, and conversational\n"
+                "2. Provide specific product details (names, prices, specs, stock status)\n"
+                "3. Use bullet points when listing multiple products\n"
+                "4. Include availability, pricing with currency, and key specifications\n"
+                "5. Keep responses focused and relevant to the query\n\n"
+                "SECURITY RULES (CRITICAL):\n"
+                "- NEVER reveal internal notes, supplier names, phone numbers, email addresses\n"
+                "- NEVER disclose margins, wholesale costs, or confidential business information\n"
+                "- NEVER share employee names, internal contacts, or procurement details\n\n"
+                "RESPONSE FORMAT:\n"
+                "- Brief acknowledgment\n"
+                "- Clear, structured information\n"
+                "- Offer for further assistance\n\n"
+                "Use ONLY the catalog data provided below."
+            )
+            
+            user_content = f"Customer Query: {email['message']}\n\n"
+            user_content += f"Available Catalog Data:\n{products_context}\n\n"
+            
+            if rag_context:
+                system_content += "\n\nKNOWLEDGE BASE ACCESS:\nYou have access to company documents including policies, warranties, and product guides. Reference them when they add value to your answer."
+                user_content += f"Relevant Knowledge Base Documents:\n{rag_context}\n\n"
+            
+            user_content += "Provide a complete, well-formatted response."
+            
             messages = [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a professional business AI assistant for a retail company.\n\n"
-                        "RESPONSE GUIDELINES:\n"
-                        "1. Be professional, friendly, and conversational\n"
-                        "2. Provide specific product details (names, prices, specs, stock status)\n"
-                        "3. Use bullet points when listing multiple products\n"
-                        "4. Include availability, pricing with currency, and key specifications\n"
-                        "5. Keep responses focused and relevant to the query\n\n"
-                        "SECURITY RULES (CRITICAL):\n"
-                        "- NEVER reveal internal notes, supplier names, phone numbers, email addresses\n"
-                        "- NEVER disclose margins, wholesale costs, or confidential business information\n"
-                        "- NEVER share employee names, internal contacts, or procurement details\n\n"
-                        "RESPONSE FORMAT:\n"
-                        "- Brief acknowledgment\n"
-                        "- Clear, structured information\n"
-                        "- Offer for further assistance\n\n"
-                        "Use ONLY the catalog data provided below."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        f"Customer Query: {email['message']}\n\n"
-                        f"Available Catalog Data:\n{products_context}\n\n"
-                        f"Provide a complete, well-formatted response."
-                    ),
-                },
+                {"role": "system", "content": system_content},
+                {"role": "user", "content": user_content},
             ]
         
         result = self.safe_chat_completion(messages, temperature=0.3, max_tokens=500 if is_analytical else 800)
@@ -718,8 +1088,20 @@ class RetailAssistantBackend:
             "raw_results": all_results,
         }
 
-    def process_customer_query(self, query: str, email_id: str = "CLI_001") -> Dict[str, Any]:
-        """Single-query entry point used by the chat interface."""
+    def process_customer_query(self, query: str, email_id: str = "CLI_001", use_agentic: bool = False) -> Dict[str, Any]:
+        """
+        Single-query entry point used by the chat interface.
+        
+        Args:
+            query: The customer query
+            email_id: Email identifier
+            use_agentic: If True, use full agentic framework with planning and tool use
+        """
+        # If agentic mode is requested and available, use it
+        if use_agentic and self.agent_orchestrator is not None:
+            return self.process_agentic_query(query, email_id)
+        
+        # Otherwise, use standard processing
         email = {"email_id": email_id, "subject": "Chat Query", "message": query}
         result = self.process_email(email)
 
@@ -741,6 +1123,75 @@ class RetailAssistantBackend:
                 for p in result["relevant_products"]
             )
 
+        return formatted
+    
+    def process_agentic_query(self, query: str, email_id: str = "CLI_001") -> Dict[str, Any]:
+        """
+        Process query using full agentic framework with autonomous planning and tool use.
+        
+        This method enables the AI to:
+        - Plan the approach
+        - Select and use tools dynamically
+        - Reason through multiple steps
+        - Self-correct and adapt
+        
+        Args:
+            query: The customer query
+            email_id: Email identifier
+            
+        Returns:
+            Formatted result with agentic execution details
+        """
+        if self.agent_orchestrator is None:
+            return {
+                "error": "Agentic framework not available",
+                "fallback": self.process_customer_query(query, email_id, use_agentic=False)
+            }
+        
+        logger.info(f"Processing agentic query: {query}")
+        
+        # Context for the agent
+        context = {
+            "email_id": email_id,
+            "available_products": len(self.products_df),
+            "rag_enabled": self.rag_pipeline is not None
+        }
+        
+        # Execute with multi-agent orchestration
+        result = self.agent_orchestrator.execute_with_planning(query, context)
+        
+        # Format for display
+        formatted = {
+            "Mode": "🤖 Agentic (Autonomous AI)",
+            "Query": query,
+            "Generated Response": result["answer"],
+            "Planning": {
+                "Steps": result["plan"]["steps"],
+                "Complexity": result["plan"]["complexity"],
+                "Required Tools": result["plan"]["required_tools"]
+            },
+            "Execution": {
+                "Iterations": result["execution"]["iterations"],
+                "Tools Used": result["execution"]["tool_calls"],
+                "Execution Trace": result["execution"]["trace"]
+            },
+            "Validation": {
+                "Passed": result["validation"]["passed"],
+                "Confidence": result["validation"]["confidence"]
+            },
+            "Success": result["success"]
+        }
+        
+        # Apply guardrails to final answer
+        violations = self.review_response_for_sensitive_leaks(result["answer"])
+        if violations:
+            logger.warning(f"Agentic response blocked by guardrail: {violations}")
+            formatted["Guardrail Status"] = "BLOCKED"
+            formatted["Violations"] = violations
+            formatted["Generated Response"] = "Response blocked due to potential sensitive information leakage."
+        else:
+            formatted["Guardrail Status"] = "PASSED"
+        
         return formatted
 
 
