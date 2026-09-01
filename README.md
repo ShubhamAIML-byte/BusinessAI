@@ -40,24 +40,4 @@ streamlit run app.py
 Optional: `internal_notes` (used only server-side to build the guardrail's
 restricted-name list; never shown to users or the LLM).
 
-**Emails** (CSV or XLSX, for batch processing) — required columns:
-`email_id, subject, message`
-
-## Using the backend outside Streamlit
-
-```python
-import pandas as pd
-from backend import load_backend_from_env, export_outputs
-
-products_df = pd.read_csv("products.csv")
-backend = load_backend_from_env(products_df)
-
-# Single query (same as the CLI chat in the original notebook)
-result = backend.process_customer_query("Do you have SKU-102 in stock?")
-print(result["Generated Response"])
-
-# Batch processing
-emails_df = pd.read_csv("emails.csv")
-dfs = backend.process_batch(emails_df)
-export_outputs(dfs, output_dir="generated_outputs")
 ```
