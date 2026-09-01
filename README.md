@@ -18,7 +18,6 @@ phone numbers, or margins ever leak into a reply).
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env
 # then edit .env and set OPENAI_API_KEY (and OPENAI_BASE_URL / OPENAI_MODEL if needed)
 ```
 
