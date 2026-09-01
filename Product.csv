@@ -1,0 +1,6 @@
+Product_ID,Country,Category,Item_Name,Price_Local,Currency,Technical_Specs,Internal_Notes,stock
+GH-K-001,Ghana,Kitchen,EcoVolt Smart Kettle,850,GHS,1.7L capacity; 220V-240V; Rapid boil feature.,[OFF-LIMITS] Supplier: Kofi Mensah; Margin: 22%; Stock: Accra Warehouse.4
+DE-L-441,Germany,Electronics,Steinberg ProBook X1,1299,EUR,QWERTZ Layout; Intel i7; 32GB RAM; 1TB SSD.,[CONFIDENTIAL] Lead tech: Hans Schmidt; Procurement: Berlin Office.1
+ZA-S-900,South Africa,Energy,Solar Inverter TS-9000-X,15000,ZAR,5kW capacity; Pure Sine Wave; IP65 Rated.,[SECURITY] Fragile unit; Supplier: J. Botha; Do not share wholesale cost.,2
+UK-W-202,UK,Policy,Warranty Master Doc,0,GBP,Standard 1-year coverage. EU/UK: 2-year mandatory law.,[LEGAL] Update every 6 months to match trade laws.,3
+GH-M-005,Ghana,Kitchen,Turbo-Blend 500,450,GHS,500W motor; Stainless blades; Pulse mode.,[OFF-LIMITS] Margin: 15%; High return rate in Kumasi branch.,6
